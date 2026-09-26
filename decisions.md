@@ -1401,3 +1401,14 @@ Asked in review of PR #16, the human chose:
    for this task only.
 2. "Yes, close it": in kernel and ledger `src/`, `cargo xtask deps` follows `include!` string paths as it follows
    `#[path]`, and scans the file; a path it can't resolve (built with `concat!`, `env!` and the like) fails the check.
+
+## R-189 — kernel and ledger `src/` use neither `#[path]` nor `include!` *(amends R-188 item 2)*
+*26 Sep 2026 · applied in TASK-M0-01 (PR #16)*
+
+Asked in review of PR #16 how to close an `include!` or `#[path]` inside a `macro_rules!` body (rustc resolves it at
+the call site), the human chose "Forbid #[path]/include!": in kernel and ledger `src/`, `#[path]` (including under
+`cfg_attr`) and `include!` are forbidden outright, and `cargo xtask deps` fails on any occurrence, naming the file and
+line. The R-187 scan then covers the `.rs` files under `src/` only, and no longer follows `#[path]` or `include!` into
+other files. R-188 item 2 ("follows `include!` string paths as it follows `#[path]`") is replaced by this. The
+check that kernel's and ledger's targets sit under `src/` stays. qa gets a one-round exception to update or remove its
+own tests that expect a `#[path]` or `include!` to be followed.
