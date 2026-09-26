@@ -1,0 +1,737 @@
+//! `cargo xtask deps` — checks the workspace crate graph against the allowed-edge table of
+//! systems_architecture §7.1, the crate map (R-170, confirmed by R-185). REQ-SYS-004.
+//!
+//! Edges *inside* one crate (decoder before kernel, canonicalise before the integrator) are not visible to
+//! a crate-graph check; they stay a code-review item (systems_architecture §7.1).
+//!
+//! It also enforces R-187's condition on the `validation` dev-dependency: in `kernel` and `ledger`, no
+//! source under `src/` uses `validation` (a test that does is an integration test in `tests/`), because
+//! the dev-dependency cycle would give unit tests two copies of the crate (`Metadata::source_violations`). The scan
+//! fails on any identifier named `validation` there, a local item included (a deliberate over-approximation: it
+//! has no name resolution), and requires the crates' library and binary targets in `src/`. So that the scan of the
+//! `.rs` files under `src/` is the whole of what those crates compile there, `#[path]`, any `include` identifier and
+//! any attribute holding a macro variable are forbidden in their `src/` (R-189, which replaces R-188's following of
+//! `include!`; R-190). The one exception is kernel's item-level `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))`,
+//! the route by which the ledger's generated code reaches it (R-185, R-190).
+
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::str::FromStr;
+
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use serde::Deserialize;
+
+/// The kind of a dependency, as `cargo metadata` reports it (`kind`: `null`, `"dev"`, `"build"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepKind {
+    Normal,
+    Dev,
+    Build,
+}
+
+impl fmt::Display for DepKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DepKind::Normal => "normal dependency",
+            DepKind::Dev => "dev-dependency",
+            DepKind::Build => "build-dependency",
+        })
+    }
+}
+
+/// Which dependency kinds an allowed edge admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kinds {
+    /// Normal, build or dev.
+    Any,
+    /// Build-dependency only.
+    BuildOnly,
+    /// Dev-dependency only.
+    DevOnly,
+}
+
+impl Kinds {
+    fn admits(self, kind: DepKind) -> bool {
+        match self {
+            Kinds::Any => true,
+            Kinds::BuildOnly => kind == DepKind::Build,
+            Kinds::DevOnly => kind == DepKind::Dev,
+        }
+    }
+}
+
+/// One allowed workspace edge: `from` depends on `to`.
+#[derive(Clone, Copy, Debug)]
+pub struct AllowedEdge {
+    pub from: &'static str,
+    pub to: &'static str,
+    pub kinds: Kinds,
+}
+
+/// `from` for §7.1's "any except `gui` (dev-dependency only) → `validation`" row (R-176, R-187): every
+/// workspace crate but `gui` and `validation` itself, `kernel` and `ledger` included.
+const ANY_EXCEPT_GUI: &str = "*";
+
+/// The allowed workspace edges, transcribed from systems_architecture §7.1 ("Allowed workspace edges";
+/// arrows read "depends on"). Every other workspace edge is forbidden.
+pub const ALLOWED: &[AllowedEdge] = &[
+    // §7: layout table → pack/unpack gen → kernel; link registry → decoder.
+    // Build-dependency only (R-185): the ledger generates code into the kernel at build time.
+    AllowedEdge { from: "kernel", to: "ledger", kinds: Kinds::BuildOnly },
+    // §7: layout table → pack/unpack gen (WGSL), debug catalogue gen.
+    AllowedEdge { from: "render", to: "ledger", kinds: Kinds::Any },
+    // §7: kernel → dispatch; chart system → validation → resolve/lowering.
+    AllowedEdge { from: "engine", to: "ledger", kinds: Kinds::Any },
+    AllowedEdge { from: "engine", to: "kernel", kinds: Kinds::Any },
+    // §7: payload → fragment assembly (the frame loop and dispatch drive the fragment side).
+    AllowedEdge { from: "engine", to: "render", kinds: Kinds::Any },
+    // GUI → state → engine (gui_state_contract §1).
+    AllowedEdge { from: "gui", to: "engine", kinds: Kinds::Any },
+    // The CLI depends on engine.
+    AllowedEdge { from: "prin", to: "engine", kinds: Kinds::Any },
+    // validation → any of the above except gui and prin: the harness exercises each seam; where it needs
+    // the CLI it runs the built `prin` binary as a separate process (R-187). So no validation → prin.
+    AllowedEdge { from: "validation", to: "kernel", kinds: Kinds::Any },
+    AllowedEdge { from: "validation", to: "ledger", kinds: Kinds::Any },
+    AllowedEdge { from: "validation", to: "render", kinds: Kinds::Any },
+    AllowedEdge { from: "validation", to: "engine", kinds: Kinds::Any },
+    // any except gui → validation, dev-dependency only (R-176, R-187). Never a normal or build dependency,
+    // so the no_std kernel and rust-gpu builds never see it.
+    AllowedEdge { from: ANY_EXCEPT_GUI, to: "validation", kinds: Kinds::DevOnly },
+];
+
+/// One workspace dependency edge: `from` depends on `to` with `kind`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub kind: DepKind,
+}
+
+/// A forbidden edge, with the rule it breaks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Violation {
+    pub edge: Edge,
+    pub rule: &'static str,
+}
+
+impl fmt::Display for Violation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "forbidden edge {} → {} ({}): {}",
+            self.edge.from, self.edge.to, self.edge.kind, self.rule
+        )
+    }
+}
+
+/// Checks each edge against the invariants of systems_architecture §7.1 and the allowed-edge table.
+/// Returns every violation (empty when the graph is allowed).
+pub fn check(edges: &[Edge]) -> Vec<Violation> {
+    edges
+        .iter()
+        .filter_map(|edge| rule_broken(edge).map(|rule| Violation { edge: edge.clone(), rule }))
+        .collect()
+}
+
+fn rule_broken(edge: &Edge) -> Option<&'static str> {
+    let (from, to) = (edge.from.as_str(), edge.to.as_str());
+    if to == "gui" {
+        return Some("nothing depends on gui (systems_architecture §7.1; gui_state_contract §1)");
+    }
+    if from == "gui" && to == "validation" {
+        return Some("gui never depends on validation, in any kind (systems_architecture §7.1; R-187)");
+    }
+    if from == "validation" && to == "prin" {
+        return Some(
+            "validation never depends on prin; it runs the built binary as a separate process \
+             (systems_architecture §7.1; R-187)",
+        );
+    }
+    if to == "validation" && edge.kind != DepKind::Dev {
+        return Some(
+            "validation is reached only as a dev-dependency, never a normal or build dependency \
+             (systems_architecture §7.1; R-176, R-187)",
+        );
+    }
+    if from == "ledger" && to != "validation" {
+        return Some(
+            "ledger is a root: it has no workspace dependency but validation as a dev-dependency \
+             (systems_architecture §7.1; R-187)",
+        );
+    }
+    if from == "kernel" && to != "ledger" && to != "validation" {
+        return Some(
+            "kernel depends on no workspace crate but ledger, and validation as a dev-dependency \
+             (systems_architecture §7.1; R-187)",
+        );
+    }
+    if from == "kernel" && to == "ledger" && edge.kind != DepKind::Build {
+        return Some("kernel → ledger is a build-dependency only (R-185)");
+    }
+    let allowed = ALLOWED.iter().any(|a| {
+        let from_matches =
+            a.from == from || (a.from == ANY_EXCEPT_GUI && from != "gui" && from != a.to);
+        from_matches && a.to == to && a.kinds.admits(edge.kind)
+    });
+    if allowed {
+        None
+    } else {
+        Some("not in the allowed-edge table (systems_architecture §7.1)")
+    }
+}
+
+/// The subset of `cargo metadata --format-version 1` the check reads.
+#[derive(Debug, Deserialize)]
+pub struct Metadata {
+    pub packages: Vec<Package>,
+    pub workspace_members: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Package {
+    pub name: String,
+    pub id: String,
+    /// The package's `Cargo.toml`. `cargo metadata` always writes it; the minimal test fixtures may not.
+    #[serde(default)]
+    pub manifest_path: Option<String>,
+    pub dependencies: Vec<Dependency>,
+    /// The package's targets. `cargo metadata` always writes them; the minimal test fixtures may not.
+    #[serde(default)]
+    pub targets: Vec<Target>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Target {
+    pub kind: Vec<String>,
+    pub src_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Dependency {
+    pub name: String,
+    pub kind: Option<String>,
+    /// `null` for a path dependency; `registry+…` or `git+…` otherwise.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The directory of a path dependency.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The name the dependent uses for it, when renamed in its `Cargo.toml`.
+    #[serde(default)]
+    pub rename: Option<String>,
+}
+
+impl Dependency {
+    /// Whether this dependency resolves to the workspace member `member`, as opposed to a package that only
+    /// shares its name. A registry or git dependency (`source` set) is never a workspace member. A path
+    /// dependency is one only if its `path` is the member's directory, when both paths are known.
+    fn is_on(&self, member: &Package) -> bool {
+        if self.source.is_some() || self.name != member.name {
+            return false;
+        }
+        match (&self.path, &member.manifest_path) {
+            (Some(path), Some(manifest)) => {
+                Path::new(manifest).parent() == Some(Path::new(path.as_str()))
+            }
+            _ => true,
+        }
+    }
+}
+
+impl Metadata {
+    /// Runs `cargo metadata --format-version 1` on this workspace.
+    pub fn from_cargo() -> Result<Self, String> {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
+        let output = Command::new(cargo)
+            .args(["metadata", "--format-version", "1", "--manifest-path"])
+            .arg(&manifest)
+            .output()
+            .map_err(|e| format!("cannot run cargo metadata: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo metadata failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Self::from_json(&output.stdout)
+    }
+
+    /// Reads a `cargo metadata` JSON document from a file (the test fixtures).
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        Self::from_json(&bytes)
+    }
+
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes).map_err(|e| format!("cannot parse cargo metadata: {e}"))
+    }
+
+    /// The workspace members, in the order `cargo metadata` lists them.
+    fn members(&self) -> Vec<&Package> {
+        self.packages.iter().filter(|p| self.workspace_members.contains(&p.id)).collect()
+    }
+
+    /// In each crate of `NO_VALIDATION_IN_SRC`, every `.rs` file under its `src/` is scanned (`scan_text`):
+    /// - R-189, R-190: any `#[path = …]` attribute (under `cfg_attr` too), any `include` identifier and any attribute
+    ///   holding a macro variable is a violation, whether or not the crate depends on `validation`, so no file
+    ///   outside `src/` joins the crate unscanned. The exception: in `OUT_DIR_INCLUDE` (kernel), the item-level
+    ///   `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))` passes, unless the crate's `src/` also defines or aliases
+    ///   a macro named `concat` or `env`, which would make that form load another file (each such site then fails);
+    /// - R-187: when the crate depends on `validation`, any identifier named `validation` or the name the crate
+    ///   gives the dependency is a violation (a deliberate over-approximation that fails local items with that
+    ///   name too).
+    ///
+    /// Every crate of `NO_VALIDATION_IN_SRC` must also keep its library and binary targets under `src/`, where the
+    /// unit tests the scan looks for live.
+    ///
+    /// `require_sources`: whether a crate to scan must have its `src/` and its targets on disk and in the
+    /// metadata. It is set for the live workspace; a fixture may describe a graph with no sources behind it, and
+    /// then the scan is skipped.
+    pub fn source_violations(&self, require_sources: bool) -> Result<Vec<SourceViolation>, String> {
+        let members = self.members();
+        let validation = members.iter().find(|m| m.name == "validation");
+        let mut violations = Vec::new();
+        for package in members.iter().filter(|m| NO_VALIDATION_IN_SRC.contains(&m.name.as_str())) {
+            let out_dir_include = OUT_DIR_INCLUDE.contains(&package.name.as_str());
+            let Some(dir) = package.manifest_path.as_deref().and_then(|m| Path::new(m).parent()) else {
+                if require_sources {
+                    return Err(format!("{}: cargo metadata gives no manifest_path", package.name));
+                }
+                continue;
+            };
+            let src = dir.join("src");
+            package.targets_under(&src, require_sources)?;
+            // The crate's own name and each name the dependency is given (a rename); empty without the dependency.
+            let mut names: Vec<String> = package
+                .dependencies
+                .iter()
+                .filter(|d| validation.is_some_and(|v| d.is_on(v)))
+                .flat_map(|d| [Some(&d.name), d.rename.as_ref()])
+                .flatten()
+                .map(|n| n.replace('-', "_"))
+                .collect();
+            names.sort();
+            names.dedup();
+            if !src.is_dir() {
+                if require_sources {
+                    return Err(format!("{}: cannot find its src/ directory to scan", package.name));
+                }
+                continue;
+            }
+            let (mut includes, mut shadows) = (0, Vec::new());
+            for file in rust_files(&src)? {
+                let text = std::fs::read_to_string(&file)
+                    .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+                let scan = scan_text(&text, &names, out_dir_include).map_err(|e| {
+                    format!(
+                        "{}: {e}; it cannot be checked for a use of validation (R-187) or for #[path] and \
+                         include! (R-189, R-190)",
+                        file.display()
+                    )
+                })?;
+                for (line, what) in scan.found {
+                    violations.push(SourceViolation { krate: package.name.clone(), file: file.clone(), line, what });
+                }
+                includes += scan.out_dir_includes.len();
+                shadows.extend(scan.shadows.into_iter().map(|line| (file.clone(), line)));
+            }
+            if includes > 0 {
+                for (file, line) in shadows {
+                    let what = Forbidden::ShadowedBuiltin;
+                    violations.push(SourceViolation { krate: package.name.clone(), file, line, what });
+                }
+            }
+        }
+        violations.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+        Ok(violations)
+    }
+
+    /// The workspace edges: each dependency of a workspace member that resolves to another workspace member
+    /// (not merely one with a member's name; see `Dependency::is_on`).
+    pub fn edges(&self) -> Result<Vec<Edge>, String> {
+        let members = self.members();
+        let is_member = |dep: &Dependency| members.iter().any(|m| dep.is_on(m));
+        let mut edges = Vec::new();
+        for package in &members {
+            for dep in package.dependencies.iter().filter(|d| is_member(d)) {
+                let kind = match dep.kind.as_deref() {
+                    None => DepKind::Normal,
+                    Some("dev") => DepKind::Dev,
+                    Some("build") => DepKind::Build,
+                    Some(other) => {
+                        return Err(format!(
+                            "{} → {}: unknown dependency kind {other:?}",
+                            package.name, dep.name
+                        ))
+                    }
+                };
+                edges.push(Edge { from: package.name.clone(), to: dep.name.clone(), kind });
+            }
+        }
+        Ok(edges)
+    }
+}
+
+impl Package {
+    /// Fails when a library or binary target of the package (the targets with unit tests; `tests/`, examples,
+    /// benches and the build script are not ones) has its root outside `src`: a `[lib] path` elsewhere would put
+    /// unit tests where R-187's scan of `src/` does not look.
+    fn targets_under(&self, src: &Path, require_sources: bool) -> Result<(), String> {
+        let with_unit_tests = |t: &&Target| {
+            t.kind.iter().any(|k| !matches!(k.as_str(), "test" | "example" | "bench" | "custom-build"))
+        };
+        let mut found = false;
+        for target in self.targets.iter().filter(with_unit_tests) {
+            found = true;
+            if !normalize(Path::new(&target.src_path)).starts_with(src) {
+                return Err(format!(
+                    "{}: its {} target is at {}, outside {}: its unit tests would escape the check that no source \
+                     under src/ uses validation (systems_architecture §7.1; R-187)",
+                    self.name,
+                    target.kind.join(", "),
+                    target.src_path,
+                    src.display()
+                ));
+            }
+        }
+        if !found && require_sources {
+            return Err(format!("{}: cargo metadata gives no library or binary target to check", self.name));
+        }
+        Ok(())
+    }
+}
+
+/// The crates in which no source under `src/` may use `validation` (systems_architecture §7.1; R-187).
+pub const NO_VALIDATION_IN_SRC: &[&str] = &["kernel", "ledger"];
+
+/// The crates of `NO_VALIDATION_IN_SRC` whose `src/` may hold the item-level
+/// `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))`: kernel, into which the ledger generates code at build time
+/// (R-185, R-190). Ledger allows no `include!` at all.
+pub const OUT_DIR_INCLUDE: &[&str] = &["kernel"];
+
+/// What a source under `src/` of a crate in `NO_VALIDATION_IN_SRC` holds that it must not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forbidden {
+    /// An identifier named `validation`, or the dependency's rename (R-187).
+    Validation,
+    /// A `#[path = …]` attribute, under `cfg_attr` too (R-189).
+    PathAttribute,
+    /// An `include` identifier other than kernel's item-level `OUT_DIR` form (R-189, R-190).
+    Include,
+    /// An attribute holding a macro variable: `#[$a]`, `#[cfg_attr(…, $a)]`, `# $a` (R-190).
+    MacroVariableAttribute,
+    /// A macro named `concat` or `env` defined or aliased in a crate whose `src/` uses the `OUT_DIR` include, which
+    /// that form would then call in place of the builtin (R-190).
+    ShadowedBuiltin,
+}
+
+/// A forbidden item in a source under `src/` of a crate in `NO_VALIDATION_IN_SRC`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceViolation {
+    pub krate: String,
+    pub file: PathBuf,
+    /// 1-based.
+    pub line: usize,
+    pub what: Forbidden,
+}
+
+impl fmt::Display for SourceViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let at = format!("{} src/ at {}:{}", self.krate, self.file.display(), self.line);
+        match self.what {
+            Forbidden::Validation => write!(
+                f,
+                "forbidden use of validation in {at}: in kernel and ledger a test that uses validation is an \
+                 integration test (tests/), not a unit test in src/ (systems_architecture §7.1; R-187). Any \
+                 identifier named validation (or the dependency's rename) outside comments and literals counts, a \
+                 local item with that name included: without name resolution `validation::x` cannot be told apart \
+                 from the crate, so rename the local item"
+            ),
+            Forbidden::PathAttribute => write!(
+                f,
+                "forbidden #[path] in {at}: kernel and ledger src/ use no #[path], so that every file they compile \
+                 there is a .rs file under src/ (R-189, R-190)"
+            ),
+            Forbidden::Include => write!(
+                f,
+                "forbidden include! in {at}: kernel and ledger src/ use no include identifier (an alias, a macro \
+                 argument and a path-qualified include! included), so that every file they compile there is a .rs \
+                 file under src/; the one exception is kernel's item-level \
+                 include!(concat!(env!(\"OUT_DIR\"), \"/<name>.rs\")), outside any macro body (R-189, R-190)"
+            ),
+            Forbidden::MacroVariableAttribute => write!(
+                f,
+                "forbidden attribute with a macro variable in {at}: kernel and ledger src/ use no attribute whose \
+                 contents hold a macro variable ($), which could expand to #[path] (R-189, R-190)"
+            ),
+            Forbidden::ShadowedBuiltin => write!(
+                f,
+                "forbidden macro named concat or env in {at}: this crate's src/ uses \
+                 include!(concat!(env!(\"OUT_DIR\"), …)), which is allowed only with the builtin concat! and env!; \
+                 this one would take their place and could load a file outside src/ (R-190)"
+            ),
+        }
+    }
+}
+
+/// Every `.rs` file under `dir`, recursively, sorted.
+fn rust_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        for entry in entries {
+            let path = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// `path` with `.` and `..` components resolved lexically.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// What `scan_text` finds in one file.
+#[derive(Debug, Default)]
+struct Scan {
+    /// The forbidden items, each with its 1-based line, sorted and without duplicates.
+    found: Vec<(usize, Forbidden)>,
+    /// The lines of the allowed item-level `OUT_DIR` includes (only when they are allowed).
+    out_dir_includes: Vec<usize>,
+    /// The lines that define or alias a macro named `concat` or `env` (only when `OUT_DIR` includes are allowed).
+    shadows: Vec<usize>,
+}
+
+/// The forbidden items in `text`. `text` is lexed with `proc-macro2`; a file that does not lex is an error, so it is
+/// never passed unscanned. Comments and string, char and byte literals are never tokens, so they hold nothing; macro
+/// bodies and attributes are scanned too.
+///
+/// - `Forbidden::Validation`: an identifier in `names` (a raw identifier `r#name` counts). Every such identifier
+///   counts as a use of the crate, a local item with the same name included (`mod validation`, `fn validation`, an
+///   associated item `<T as Tr>::validation`). This over-approximates R-187 on purpose: from edition 2018
+///   `validation::x` may name a local module or the extern crate, and only name resolution can tell them apart,
+///   so a check without it that must never pass a real use has to fail both. Rename the local item.
+/// - `Forbidden::PathAttribute` (R-189): an identifier `path` followed by `=` anywhere inside an attribute, so
+///   `#[path = …]`, `#![path = …]` and `#[cfg_attr(…, path = …)]`, in a `macro_rules!` body too. Another attribute
+///   with a `path = …` argument fails as well (an over-approximation, never under). A `path` outside an attribute
+///   (`let path = …`) is not one (R-190).
+/// - `Forbidden::Include` (R-189, R-190): any identifier `include` (a raw `r#include` too), whatever follows it, so
+///   `include!`, `std::include!`, `use std::include as inc`, `m!(include)`, in a `macro_rules!` body too. The one
+///   exception, when `out_dir_include` is set (kernel): `out_dir_include_at` holds. `include_str!` and
+///   `include_bytes!` are other identifiers and stay allowed: they expand to a `&str` or `&[u8]` value, never to
+///   Rust tokens.
+/// - `Forbidden::MacroVariableAttribute` (R-190): a `$` anywhere inside an attribute (`#[$a]`, `#[$($t)*]`,
+///   `#[cfg_attr(…, $a)]`), or an attribute whose brackets are themselves a macro variable (`# $a`, `#! $a`).
+///
+/// With `out_dir_include` set, `Scan::shadows` also lists `macro_rules! concat|env`, `macro concat|env` and
+/// `as concat|env`, the ways a crate can put its own macro in place of the builtin the exception names.
+fn scan_text(text: &str, names: &[String], out_dir_include: bool) -> Result<Scan, String> {
+    struct Ctx<'a> {
+        names: &'a [String],
+        out_dir_include: bool,
+        scan: Scan,
+    }
+    /// `item_level`: `stream` is the file or the body of a `mod name { … }` reached from it through `mod` bodies
+    /// only, so never a macro definition, a macro invocation, a function body or an attribute.
+    fn walk(stream: TokenStream, ctx: &mut Ctx<'_>, in_attr: bool, item_level: bool) {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        let punct = |k: usize, c: char| matches!(trees.get(k), Some(TokenTree::Punct(p)) if p.as_char() == c);
+        let ident = |k: usize, w: &str| matches!(trees.get(k), Some(TokenTree::Ident(id)) if id == w);
+        for (i, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Ident(id) => {
+                    let line = id.span().start().line;
+                    let word = id.to_string();
+                    let word = word.strip_prefix("r#").unwrap_or(&word);
+                    if ctx.names.iter().any(|n| n == word) {
+                        ctx.scan.found.push((line, Forbidden::Validation));
+                    }
+                    if in_attr && word == "path" && punct(i + 1, '=') {
+                        ctx.scan.found.push((line, Forbidden::PathAttribute));
+                    }
+                    if word == "include" {
+                        if ctx.out_dir_include && !in_attr && item_level && out_dir_include_at(&trees, i) {
+                            ctx.scan.out_dir_includes.push(line);
+                        } else {
+                            ctx.scan.found.push((line, Forbidden::Include));
+                        }
+                    }
+                    let shadow = |w: &str| {
+                        (w == "concat" || w == "env")
+                            && ((punct(i.wrapping_sub(1), '!') && ident(i.wrapping_sub(2), "macro_rules"))
+                                || ident(i.wrapping_sub(1), "macro")
+                                || ident(i.wrapping_sub(1), "as"))
+                    };
+                    if ctx.out_dir_include && shadow(word) {
+                        ctx.scan.shadows.push(line);
+                    }
+                }
+                TokenTree::Punct(p) => {
+                    let line = p.span().start().line;
+                    if in_attr && p.as_char() == '$' {
+                        ctx.scan.found.push((line, Forbidden::MacroVariableAttribute));
+                    }
+                    if p.as_char() == '#' && (punct(i + 1, '$') || (punct(i + 1, '!') && punct(i + 2, '$'))) {
+                        ctx.scan.found.push((line, Forbidden::MacroVariableAttribute));
+                    }
+                }
+                TokenTree::Group(group) => {
+                    // `i.wrapping_sub(k)` is out of range, so `None`, before the first token.
+                    let attr = group.delimiter() == Delimiter::Bracket
+                        && (punct(i.wrapping_sub(1), '#')
+                            || (punct(i.wrapping_sub(1), '!') && punct(i.wrapping_sub(2), '#')));
+                    let mod_body = group.delimiter() == Delimiter::Brace
+                        && matches!(trees.get(i.wrapping_sub(1)), Some(TokenTree::Ident(_)))
+                        && ident(i.wrapping_sub(2), "mod");
+                    walk(group.stream(), ctx, in_attr || attr, item_level && mod_body && !attr);
+                }
+                TokenTree::Literal(_) => {}
+            }
+        }
+    }
+    let stream = TokenStream::from_str(text).map_err(|e| format!("cannot lex it: {e}"))?;
+    let mut ctx = Ctx { names, out_dir_include, scan: Scan::default() };
+    walk(stream, &mut ctx, false, true);
+    let mut scan = ctx.scan;
+    scan.found.sort_by_key(|&(line, what)| (line, what as u8));
+    scan.found.dedup();
+    Ok(scan)
+}
+
+/// Whether `trees[i]`, an identifier `include` in an item-level stream, is the start of the one `include!` R-190
+/// allows in kernel `src/`: the bare identifier `include` (not raw, not path-qualified), at the start of an item
+/// (after nothing, `;`, a `{ … }` item or outer or inner attributes), followed by `!`, then exactly
+/// `(concat!(env!("OUT_DIR"), "/<name>.rs"))`, then `;`. `<name>` is a plain file name: ASCII letters, digits, `_`,
+/// `-` and `.`, not starting with `.`, with no `..`, ending in `.rs`. Anything that differs is not the form.
+fn out_dir_include_at(trees: &[TokenTree], i: usize) -> bool {
+    let punct = |k: usize, c: char| matches!(trees.get(k), Some(TokenTree::Punct(p)) if p.as_char() == c);
+    if !matches!(&trees[i], TokenTree::Ident(id) if id == "include") {
+        return false;
+    }
+    // The start of an item: skip back over attributes, then nothing, `;` or a `{ … }` group.
+    let mut k = i;
+    let item_start = loop {
+        if k == 0 {
+            break true;
+        }
+        match &trees[k - 1] {
+            TokenTree::Punct(p) if p.as_char() == ';' => break true,
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => break true,
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket && k >= 2 && punct(k - 2, '#') => k -= 2,
+            TokenTree::Group(g)
+                if g.delimiter() == Delimiter::Bracket && k >= 3 && punct(k - 2, '!') && punct(k - 3, '#') =>
+            {
+                k -= 3
+            }
+            _ => break false,
+        }
+    };
+    let Some(TokenTree::Group(arg)) = trees.get(i + 2) else { return false };
+    item_start && punct(i + 1, '!') && arg.delimiter() == Delimiter::Parenthesis && punct(i + 3, ';')
+        && out_dir_argument(arg.stream())
+}
+
+/// Whether `stream` is exactly `concat!(env!("OUT_DIR"), "/<name>.rs")` (see `out_dir_include_at`).
+fn out_dir_argument(stream: TokenStream) -> bool {
+    let is = |t: Option<&TokenTree>, w: &str| match t {
+        Some(TokenTree::Ident(id)) => id == w,
+        Some(TokenTree::Punct(p)) => w.len() == 1 && w.starts_with(p.as_char()),
+        Some(TokenTree::Literal(l)) => l.to_string() == w,
+        _ => false,
+    };
+    let paren = |t: Option<&TokenTree>| match t {
+        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
+            Some(g.stream().into_iter().collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    let outer: Vec<TokenTree> = stream.into_iter().collect();
+    let Some(concat) = paren(outer.get(2)) else { return false };
+    let Some(env) = paren(concat.get(2)) else { return false };
+    let file_name = |t: Option<&TokenTree>| {
+        let Some(TokenTree::Literal(l)) = t else { return false };
+        let text = l.to_string();
+        let Some(name) = text.strip_prefix("\"/").and_then(|n| n.strip_suffix('"')) else { return false };
+        name.len() > ".rs".len()
+            && name.ends_with(".rs")
+            && !name.starts_with('.')
+            && !name.contains("..")
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    outer.len() == 3
+        && is(outer.first(), "concat")
+        && is(outer.get(1), "!")
+        && concat.len() == 5
+        && is(concat.first(), "env")
+        && is(concat.get(1), "!")
+        && env.len() == 1
+        && is(env.first(), "\"OUT_DIR\"")
+        && is(concat.get(3), ",")
+        && file_name(concat.get(4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_text, Forbidden};
+
+    fn lines(src: &str) -> Vec<usize> {
+        let found = scan_text(src, &["validation".to_owned()], false).unwrap().found;
+        found.into_iter().filter(|&(_, what)| what == Forbidden::Validation).map(|(line, _)| line).collect()
+    }
+
+    #[test]
+    fn scan_text_finds_every_identifier_with_the_name() {
+        let src = "use validation::Harness;\n\
+                   extern crate validation;\n\
+                   fn g() -> u8 { <u8 as Tr>::validation::X }\n\
+                   mod validation {}\n\
+                   fn f() { vec![r#validation::X]; }\n\
+                   #[validation::attr] fn h() {}\n\
+                   fn t(c: char, d: u8) -> bool { 'a' < c && d > ::validation::LIMIT }\n";
+        assert_eq!(lines(src), vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn scan_text_ignores_comments_and_literals() {
+        // Control for the test above: the name in places that are not identifiers.
+        let src = "// validation::run();\n\
+                   /* use validation; */\n\
+                   /// validation in a doc comment\n\
+                   const S: &str = \"validation::run\";\n\
+                   const R: &str = r#\"use validation;\"#;\n\
+                   const C: &core::ffi::CStr = cr#\"a\"validation\"#;\n\
+                   const B: &[u8] = b\"validation\";\n\
+                   fn f() -> char { 'v' }\n";
+        assert_eq!(lines(src), Vec::<usize>::new());
+        assert_eq!(lines("\n\nfn f() { validation(); }"), vec![3]);
+    }
+
+    #[test]
+    fn scan_text_fails_on_a_file_that_does_not_lex() {
+        assert!(scan_text("fn f() { \"unterminated }", &["validation".to_owned()], false).is_err());
+        // Control: the same file, terminated.
+        assert!(scan_text("fn f() { \"terminated\" }", &["validation".to_owned()], false).is_ok());
+    }
+}
