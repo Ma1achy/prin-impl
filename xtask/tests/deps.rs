@@ -461,7 +461,7 @@ fn deps_a_path_attribute_in_kernel_or_ledger_src_fails() {
                 assert!(!ok, "{name} {case} (dev {dev}): a #[path] in src/ passes:\n{stderr}");
                 assert!(stderr.contains(&expected), "{name} {case}: {stderr}");
                 assert!(stderr.contains(&format!("src/lib.rs:{line}")), "{name} {case}: no file and line:\n{stderr}");
-                assert!(stderr.contains("(R-189)"), "{name} {case}: does not cite R-189:\n{stderr}");
+                assert!(stderr.contains("R-189"), "{name} {case}: does not cite R-189:\n{stderr}");
                 // Control: the same file without the attribute.
                 let files = [("src/lib.rs", without), ("src/t.rs", ""), ("elsewhere/t.rs", "")];
                 let (ok, stderr) = run_source(&format!("path_{name}_{case}_{dev}_control"), name, dev, &files);
@@ -479,7 +479,7 @@ fn deps_a_cfg_attr_path_in_kernel_src_fails() {
     let files = [("src/lib.rs", with), ("src/t.rs", ""), ("elsewhere/t.rs", "")];
     let (ok, stderr) = run_source("cfg_attr_path", "kernel", true, &files);
     assert!(!ok && stderr.contains("forbidden #[path] in kernel src/ at "), "{stderr}");
-    assert!(stderr.contains("src/lib.rs:3") && stderr.contains("(R-189)"), "{stderr}");
+    assert!(stderr.contains("src/lib.rs:3") && stderr.contains("R-189"), "{stderr}");
     let without = "pub fn f() {}\n\n#[cfg_attr(test, allow(dead_code))]\nmod t;\n";
     let files = [("src/lib.rs", without), ("src/t.rs", "")];
     let (ok, stderr) = run_source("cfg_attr_path_control", "kernel", true, &files);
@@ -505,7 +505,7 @@ fn deps_an_include_in_kernel_or_ledger_src_fails() {
                 assert!(!ok, "{name} {case} (dev {dev}): an include! in src/ passes:\n{stderr}");
                 assert!(stderr.contains(&format!("forbidden include! in {name} src/ at ")), "{name} {case}: {stderr}");
                 assert!(stderr.contains("src/lib.rs:3"), "{name} {case}: no file and line:\n{stderr}");
-                assert!(stderr.contains("(R-189)"), "{name} {case}: does not cite R-189:\n{stderr}");
+                assert!(stderr.contains("R-189"), "{name} {case}: does not cite R-189:\n{stderr}");
                 // Controls: the same file without the macro, and with include_str!/include_bytes! in its place.
                 let without = with.replace("include!", "stringify!");
                 let as_str = with.replace("include!", "include_str!");
@@ -518,5 +518,152 @@ fn deps_an_include_in_kernel_or_ledger_src_fails() {
                 }
             }
         }
+    }
+}
+
+/// Runs `xtask deps` on a synthetic workspace whose `crate_name` has `src/lib.rs` = `lib` (plus an empty `src/t.rs`
+/// and a file outside src/ that a forbidden item could load), without a dependency on validation.
+fn run_lib(case: &str, crate_name: &str, lib: &str) -> (bool, String) {
+    let files = [("src/lib.rs", lib), ("src/t.rs", ""), ("gen/t.rs", "pub fn t() {}\n")];
+    run_source(case, crate_name, false, &files)
+}
+
+/// Asserts `stderr` names a forbidden `what` in `crate_name` src/ at `src/lib.rs:<line>`, citing R-190.
+fn assert_names(case: &str, stderr: &str, what: &str, crate_name: &str, line: usize) {
+    let named = stderr.lines().any(|l| {
+        l.contains(&format!("forbidden {what} in {crate_name} src/ at "))
+            && l.contains(&format!("src/lib.rs:{line}:"))
+            && l.contains("R-190")
+    });
+    assert!(named, "{case}: no failure names {what} at src/lib.rs:{line}, citing R-190:\n{stderr}");
+}
+
+const OUT_DIR_FORM: &str = "pub fn f() {}\n\ninclude!(concat!(env!(\"OUT_DIR\"), \"/layout.rs\"));\n";
+
+/// R-190: kernel src/ may hold the item-level `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))`, at the file's top
+/// level, after an attribute, and in a `mod` body; ledger src/ may not. Control for the kernel passes: the same
+/// file in ledger fails, naming the file and line.
+#[test]
+fn deps_the_out_dir_include_passes_in_kernel_src_and_fails_in_ledger_src() {
+    let forms = [
+        ("top", OUT_DIR_FORM, 3),
+        ("attr", "pub fn f() {}\n#[allow(dead_code)]\ninclude!(concat!(env!(\"OUT_DIR\"), \"/layout.rs\"));\n", 3),
+        ("mod", "pub mod gen {\n    include!(concat!(env!(\"OUT_DIR\"), \"/layout.rs\"));\n}\n", 2),
+    ];
+    for (case, lib, line) in forms {
+        for dev in [false, true] {
+            let files = [("src/lib.rs", lib)];
+            let (ok, stderr) = run_source(&format!("out_dir_kernel_{case}_{dev}"), "kernel", dev, &files);
+            assert!(ok, "{case} (dev {dev}): the OUT_DIR include in kernel src/ fails:\n{stderr}");
+            // Control: the same file in ledger src/ fails.
+            let (ok, stderr) = run_source(&format!("out_dir_ledger_{case}_{dev}"), "ledger", dev, &files);
+            assert!(!ok, "{case} (dev {dev}): the OUT_DIR include in ledger src/ passes:\n{stderr}");
+            assert_names(case, &stderr, "include!", "ledger", line);
+        }
+    }
+}
+
+/// R-190: only the exact item-level form passes in kernel src/. Inside a `macro_rules!` body, path-qualified
+/// (`std::include!`), with `..` in the literal, in a function body, with another directory than `OUT_DIR`, with a
+/// subdirectory, braces or a trailing comma, it fails, naming the file and line. Control: `OUT_DIR_FORM` passes.
+#[test]
+fn deps_any_other_out_dir_include_in_kernel_src_fails() {
+    let form = "include!(concat!(env!(\"OUT_DIR\"), \"/layout.rs\"));";
+    let cases = [
+        ("macro", format!("macro_rules! m {{\n    () => {{\n        {form}\n    }};\n}}\nm!();\n"), 3),
+        ("std", format!("pub fn f() {{}}\n\nstd::{form}\n"), 3),
+        ("dotdot", OUT_DIR_FORM.replace("/layout.rs", "/../../../gen/t.rs"), 3),
+        ("fn_body", format!("pub fn f() {{\n    {form}\n}}\n"), 2),
+        ("other_var", OUT_DIR_FORM.replace("OUT_DIR", "CARGO_MANIFEST_DIR"), 3),
+        ("subdir", OUT_DIR_FORM.replace("/layout.rs", "/a/layout.rs"), 3),
+        ("braces", "pub fn f() {}\n\ninclude! { concat!(env!(\"OUT_DIR\"), \"/layout.rs\") }\n".to_owned(), 3),
+        ("trailing_comma", OUT_DIR_FORM.replace("\"/layout.rs\")", "\"/layout.rs\",)"), 3),
+        ("expression", "pub fn f() {}\n\nconst X: u8 = include!(concat!(env!(\"OUT_DIR\"), \"/n.rs\"));\n".to_owned(), 3),
+    ];
+    for (case, lib, line) in cases {
+        let (ok, stderr) = run_lib(&format!("out_dir_other_{case}"), "kernel", &lib);
+        assert!(!ok, "{case}: this include! in kernel src/ passes:\n{lib}\n{stderr}");
+        assert_names(case, &stderr, "include!", "kernel", line);
+    }
+    let (ok, stderr) = run_lib("out_dir_other_control", "kernel", OUT_DIR_FORM);
+    assert!(ok, "control, the OUT_DIR form, fails:\n{stderr}");
+}
+
+/// R-190: a macro named `env` or `concat` defined or aliased in kernel src/ would take the builtin's place in the
+/// OUT_DIR form, so it fails when that form is used, naming its own line. Control: without the OUT_DIR include the
+/// same definition passes, and so does the OUT_DIR form with a macro of another name.
+#[test]
+fn deps_a_shadowed_env_or_concat_with_the_out_dir_include_fails() {
+    let shadows = [
+        ("env", "macro_rules! env {\n    ($x:literal) => { \"../gen\" };\n}\n"),
+        ("concat", "macro_rules! concat {\n    ($($x:tt)*) => { \"../gen/t.rs\" };\n}\n"),
+        ("alias", "use core::stringify as env;\n"),
+    ];
+    for (case, shadow) in shadows {
+        let lib = format!("{shadow}{OUT_DIR_FORM}");
+        let (ok, stderr) = run_lib(&format!("shadow_{case}"), "kernel", &lib);
+        assert!(!ok, "{case}: a shadowed builtin with the OUT_DIR include passes:\n{stderr}");
+        assert_names(case, &stderr, "macro named concat or env", "kernel", 1);
+        let (ok, stderr) = run_lib(&format!("shadow_{case}_control"), "kernel", shadow);
+        assert!(ok, "{case}: control, the definition without the OUT_DIR include, fails:\n{stderr}");
+    }
+    let other = format!("macro_rules! gen {{\n    () => {{}};\n}}\n{OUT_DIR_FORM}");
+    let (ok, stderr) = run_lib("shadow_other_control", "kernel", &other);
+    assert!(ok, "control, a macro of another name with the OUT_DIR include, fails:\n{stderr}");
+}
+
+/// R-190: any other `include` identifier fails in kernel and ledger src/: an alias (`use std::include as inc`) and
+/// `include` passed to a macro (`m!(include)`), naming the file and line. Controls: `stringify` in its place passes.
+#[test]
+fn deps_an_aliased_or_passed_include_fails() {
+    let cases = [
+        ("alias", "use std::include as inc;\ninc!(\"../gen/t.rs\");\n", 1),
+        ("passed", "macro_rules! m {\n    ($i:ident) => { $i!(\"../gen/t.rs\"); };\n}\nm!(include);\n", 4),
+    ];
+    for name in ["kernel", "ledger"] {
+        for (case, lib, line) in cases {
+            let (ok, stderr) = run_lib(&format!("include_ident_{name}_{case}"), name, lib);
+            assert!(!ok, "{name} {case}: passes:\n{stderr}");
+            assert_names(case, &stderr, "include!", name, line);
+            let control = lib.replace("include", "stringify");
+            let (ok, stderr) = run_lib(&format!("include_ident_{name}_{case}_control"), name, &control);
+            assert!(ok, "{name} {case}: control with stringify fails:\n{stderr}");
+        }
+    }
+}
+
+/// R-190: an attribute holding a macro variable fails in kernel and ledger src/ (`#[$a]`, `#[cfg_attr(test, $a)]`,
+/// `# $a`), naming the file and line. Control: a `#[cfg(test)]` attribute in the same macro body (no `$`) passes.
+#[test]
+fn deps_an_attribute_with_a_macro_variable_fails() {
+    let cases = [
+        ("meta", "macro_rules! m {\n    ($a:meta) => {\n        #[$a] mod t;\n    };\n}\n"),
+        ("cfg_attr", "macro_rules! m {\n    ($a:meta) => {\n        #[cfg_attr(test, $a)] mod t;\n    };\n}\n"),
+        ("tt", "macro_rules! m {\n    ($a:tt) => {\n        # $a mod t;\n    };\n}\n"),
+    ];
+    for name in ["kernel", "ledger"] {
+        for (case, lib) in cases {
+            let (ok, stderr) = run_lib(&format!("macro_var_attr_{name}_{case}"), name, lib);
+            assert!(!ok, "{name} {case}: passes:\n{stderr}");
+            assert_names(case, &stderr, "attribute with a macro variable", name, 3);
+        }
+        let control = "macro_rules! m {\n    () => {\n        #[cfg(test)] mod t;\n    };\n}\n";
+        let (ok, stderr) = run_lib(&format!("macro_var_attr_{name}_control"), name, control);
+        assert!(ok, "{name}: control, #[cfg(test)] in a macro body, fails:\n{stderr}");
+    }
+}
+
+/// R-190: `path` outside an attribute is an ordinary identifier (`let path = 1;`), and passes in kernel and ledger
+/// src/. Control: the same `path = …` as an attribute fails.
+#[test]
+fn deps_a_path_binding_passes() {
+    for name in ["kernel", "ledger"] {
+        let lib = "pub fn f() -> u8 {\n    let path = 1;\n    path\n}\n";
+        let (ok, stderr) = run_lib(&format!("path_binding_{name}"), name, lib);
+        assert!(ok, "{name}: `let path = 1;` fails:\n{stderr}");
+        let control = "pub fn f() {}\n#[path = \"../gen/t.rs\"]\nmod t;\n";
+        let (ok, stderr) = run_lib(&format!("path_binding_{name}_control"), name, control);
+        assert!(!ok, "{name}: control, #[path], passes:\n{stderr}");
+        assert_names("path", &stderr, "#[path]", name, 2);
     }
 }
