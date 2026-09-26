@@ -1412,3 +1412,17 @@ line. The R-187 scan then covers the `.rs` files under `src/` only, and no longe
 other files. R-188 item 2 ("follows `include!` string paths as it follows `#[path]`") is replaced by this. The
 check that kernel's and ledger's targets sit under `src/` stays. qa gets a one-round exception to update or remove its
 own tests that expect a `#[path]` or `include!` to be followed.
+
+## R-190 — kernel `src/` may include the ledger's generated code from `OUT_DIR`; everything else `include`-shaped fails *(amends R-189)*
+*26 Sep 2026 · applied in TASK-M0-01 (PR #16)*
+
+R-189 forbade every `include!` in kernel `src/`, which also forbade the usual route by which R-185's generated code
+("the ledger generates code into the kernel at build time") reaches the kernel. Asked in review of PR #16, the human
+chose "Allow the OUT_DIR form":
+- In kernel `src/`, exactly one form is allowed: `include!(concat!(env!("OUT_DIR"), "/<literal>.rs"))`, at item level,
+  not inside a macro body and not through an alias. Ledger `src/` allows no `include!` at all, as R-189 has it.
+- Everything else fails `cargo xtask deps` in kernel and ledger `src/`: any other `include` identifier (which covers
+  `use std::include as …` and `include` passed to a macro), any `#[path]` (as R-189), and any attribute whose contents
+  include a macro variable (`#[$a]`, `#[$($t)*]`, `#[cfg_attr(…, $a)]`).
+- qa's suggested rule, failing on any `path` followed by `=` anywhere, is not adopted. It would catch ordinary bindings
+  such as `let path = …`. The macro-variable attribute rule closes the same bypass.
