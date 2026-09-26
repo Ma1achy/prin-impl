@@ -2091,3 +2091,26 @@ Tick any you don't accept.
 - **Needed:** (1) whether `kernel` and `ledger` may take `validation` as a dev-dependency (reading A), or not
   (reading B). (2) whether `validation` may depend on `prin`.
 - **Ruling:** R-187 (decisions.md). Closed in TASK-M0-01 (PR #16).
+
+## RQ-130: R-190 — an attribute assembled from macro variables with no `#[` in the source *(build, TASK-M0-01)*
+
+- **File, section:** `decisions.md` § "R-190 — kernel `src/` may include the ledger's generated code from `OUT_DIR`;
+  everything else `include`-shaped fails *(amends R-189)*": "any attribute whose contents include a macro variable
+  (`#[$a]`, `#[$($t)*]`, `#[cfg_attr(…, $a)]`)".
+- **Finding:** the rule covers an attribute whose `#` is written in the source. A `macro_rules!` can take the `#` and
+  the bracket group as two `tt` fragments, so neither the body nor the invocation holds an attribute, and rustc still
+  expands them to `#[path]`. In ledger or kernel `src/lib.rs`:
+  ```rust
+  macro_rules! m { ($h:tt ; $g:tt) => { $h $g mod t; }; }
+  m!(# ; [path = "../gen/t.rs"]);
+  ```
+  `rustc --edition 2021 --crate-type lib` compiles it and loads `gen/t.rs`. `cargo xtask deps` passes it at the
+  TASK-M0-01 head: `[path = …]` in the invocation is a bracket group with no `#` before it, and the body has no `#`.
+  `$h [path = "../gen/t.rs"] mod t;` invoked as `m!(#)` is the same case. R-190 names `# $a` only by implication;
+  the code treats `#` followed by `$` as an attribute holding a macro variable and fails it.
+- **What the code applies until a ruling:** R-190's words. These spellings pass.
+- **Needed:** a rule that closes it, or a ruling that it stays a review item. For example, one of:
+  (a) fail a bracket group holding `path` followed by `=` anywhere in kernel and ledger `src/`, not only in an
+  attribute (it catches `[path = …]` passed as a `tt`, and not `let path = …`); or (b) fail a `tt` fragment spliced
+  directly before a bracket group or another `$` fragment at item position in a macro body.
+- **Ruling:** open.
