@@ -220,7 +220,7 @@ fn source_workspace(case: &str, crate_name: &str, extra_dev: &str, files: &[(&st
             "validation" => vec![dep("ledger", "null"), dep("kernel", "null")],
             _ => vec![],
         };
-        if name == crate_name {
+        if name == crate_name && !extra_dev.is_empty() {
             deps.push(extra_dev.replace("{ws}", &ws));
         }
         deps.join(", ")
@@ -402,51 +402,6 @@ fn deps_a_src_file_that_does_not_lex_fails() {
     assert!(ok, "{stderr}");
 }
 
-/// A file a `#[path]` attribute in kernel src/ names is scanned too, relative to the declaring file (and, inside an
-/// inline module, below the module's directory), as is a `mod name;` in that file: a unit test cannot reach a use of
-/// validation outside src/ through it. Each case fails naming the file; the control, the same files without the
-/// identifier, passes. A `#[path]` naming no file fails, never passes unscanned.
-#[test]
-fn deps_scans_files_loaded_by_a_path_attribute() {
-    let use_it = "#[cfg(test)]\nfn t() { validation::run(); }\n";
-    let cases: [(&str, &[(&str, &str)], &str); 4] = [
-        ("outside", &[("src/lib.rs", "#[cfg(test)]\n#[path = \"../elsewhere/t.rs\"]\nmod t;\n")], "elsewhere/t.rs:2"),
-        (
-            "cfg_attr",
-            &[("src/lib.rs", "#[cfg_attr(test, path = r\"../elsewhere/t.rs\")]\nmod t;\n")],
-            "elsewhere/t.rs:2",
-        ),
-        (
-            "inline",
-            &[("src/lib.rs", "#[cfg(test)]\nmod tests {\n    #[path = \"../../elsewhere/t.rs\"]\n    mod t;\n}\n")],
-            "elsewhere/t.rs:2",
-        ),
-        (
-            "nested",
-            &[("src/lib.rs", "#[path = \"../elsewhere/t.rs\"]\nmod t;\n"), ("elsewhere/t/u.rs", use_it)],
-            "elsewhere/t/u.rs:2",
-        ),
-    ];
-    for (case, files, named) in cases {
-        let t = if case == "nested" { "mod u;\n" } else { use_it };
-        let mut with_use: Vec<(&str, &str)> = files.to_vec();
-        with_use.push(("elsewhere/t.rs", t));
-        let metadata = source_workspace(&format!("path_{case}"), "kernel", DEV_ON_VALIDATION, &with_use);
-        let (ok, stderr) = run_deps_path(&metadata);
-        assert!(!ok && stderr.contains(named), "{case}: a use in the file #[path] loads passes:\n{stderr}");
-        // Control: the same files without the identifier.
-        let plain: Vec<(&str, String)> =
-            with_use.iter().map(|(p, s)| (*p, s.replace("validation", "checks"))).collect();
-        let plain: Vec<(&str, &str)> = plain.iter().map(|(p, s)| (*p, s.as_str())).collect();
-        let metadata = source_workspace(&format!("path_{case}_plain"), "kernel", DEV_ON_VALIDATION, &plain);
-        let (ok, stderr) = run_deps_path(&metadata);
-        assert!(ok, "{case}: control, the files without the identifier, fails:\n{stderr}");
-    }
-    let missing = [("src/lib.rs", "#[path = \"../elsewhere/gone.rs\"]\nmod t;\n")];
-    let (ok, stderr) = run_deps_path(&source_workspace("path_missing", "kernel", DEV_ON_VALIDATION, &missing));
-    assert!(!ok && stderr.contains("src/lib.rs: #[path = \"../elsewhere/gone.rs\"]"), "{stderr}");
-}
-
 /// Sets `crate_name`'s targets in the metadata at `path` to one `lib` target at `src_path` (relative to the crate).
 fn with_lib_target(path: &std::path::Path, crate_name: &str, src_path: &str) {
     let mut doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -476,84 +431,92 @@ fn deps_a_kernel_or_ledger_lib_outside_src_fails() {
     }
 }
 
-/// R-188: a file an `include!` in kernel src/ loads is scanned too, resolved relative to the including file, and
-/// transitively (an `include!` in the included file, a `mod` it declares). Each case fails naming the included file
-/// and line; the control, the same files without the identifier, passes.
-#[test]
-fn deps_scans_files_loaded_by_include() {
-    let use_it = "\nfn t() { validation::run(); }\n";
-    let cases: [(&str, &[(&str, &str)], &str); 4] = [
-        ("outside", &[("src/lib.rs", "include!(\"../elsewhere/t.rs\");\n")], "elsewhere/t.rs:2"),
-        (
-            "in_tests",
-            &[("src/lib.rs", "#[cfg(test)]\nmod tests {\n    std::include! { r\"../../kernel/elsewhere/t.rs\", }\n}\n")],
-            "elsewhere/t.rs:2",
-        ),
-        (
-            "transitive",
-            &[("src/lib.rs", "include!(\"../elsewhere/i.rs\");\n"), ("elsewhere/i.rs", "include!(\"t.rs\");\n")],
-            "elsewhere/t.rs:2",
-        ),
-        (
-            "from_path_module",
-            &[("src/lib.rs", "#[path = \"../elsewhere/m.rs\"]\nmod m;\n"), ("elsewhere/m.rs", "include!(\"t.rs\");\n")],
-            "elsewhere/t.rs:2",
-        ),
-    ];
-    for (case, files, named) in cases {
-        let mut with_use: Vec<(&str, &str)> = files.to_vec();
-        with_use.push(("elsewhere/t.rs", use_it));
-        let metadata = source_workspace(&format!("include_{case}"), "kernel", DEV_ON_VALIDATION, &with_use);
-        let (ok, stderr) = run_deps_path(&metadata);
-        assert!(!ok && stderr.contains(named), "{case}: a use in the file include! loads passes:\n{stderr}");
-        // Control: the same files without the identifier.
-        let plain: Vec<(&str, String)> =
-            with_use.iter().map(|(p, s)| (*p, s.replace("validation", "checks"))).collect();
-        let plain: Vec<(&str, &str)> = plain.iter().map(|(p, s)| (*p, s.as_str())).collect();
-        let metadata = source_workspace(&format!("include_{case}_plain"), "kernel", DEV_ON_VALIDATION, &plain);
-        let (ok, stderr) = run_deps_path(&metadata);
-        assert!(ok, "{case}: control, the files without the identifier, fails:\n{stderr}");
-    }
+/// Runs `xtask deps` on a synthetic workspace whose `crate_name` has `files`, with or without a dev-dependency on
+/// validation; returns (success, stderr).
+fn run_source(case: &str, crate_name: &str, dev_on_validation: bool, files: &[(&str, &str)]) -> (bool, String) {
+    let dev = if dev_on_validation { DEV_ON_VALIDATION } else { "" };
+    run_deps_path(&source_workspace(case, crate_name, dev, files))
 }
 
-/// R-188: an `include!` whose path resolves to no file fails, naming the including file and line. Control: the same
-/// `include!` with the file present passes.
+/// R-189: a `#[path]` attribute in kernel or ledger src/ fails `xtask deps`, naming the file and line and citing
+/// R-189, with or without a dependency on validation: as an outer or inner attribute, and inside a `macro_rules!`
+/// body. Control: the same file without the attribute (the module at its default place) passes.
 #[test]
-fn deps_an_unresolvable_include_fails() {
-    let lib = [("src/lib.rs", "pub fn f() {}\n\ninclude!(\"../elsewhere/gone.rs\");\n")];
-    let (ok, stderr) = run_deps_path(&source_workspace("include_missing", "kernel", DEV_ON_VALIDATION, &lib));
-    assert!(!ok && stderr.contains("src/lib.rs:3: include!(\"../elsewhere/gone.rs\") names no file"), "{stderr}");
-    let present = [lib[0], ("elsewhere/gone.rs", "fn g() {}\n")];
-    let (ok, stderr) =
-        run_deps_path(&source_workspace("include_missing_control", "kernel", DEV_ON_VALIDATION, &present));
-    assert!(ok, "control, the included file present, fails:\n{stderr}");
-}
-
-/// R-188: an `include!` whose path is not a plain string literal (`concat!`, `env!`, an escaped string) cannot be
-/// resolved without expanding it, and fails, naming the file and line. Controls: the same file with a literal path
-/// passes, and `include_str!`/`include_bytes!` with a non-literal path pass (they load no Rust tokens).
-#[test]
-fn deps_a_non_literal_include_path_fails() {
+fn deps_a_path_attribute_in_kernel_or_ledger_src_fails() {
     let cases = [
-        ("concat", "include!(concat!(env!(\"OUT_DIR\"), \"/t.rs\"));"),
-        ("env", "include!(env!(\"T_RS\"));"),
-        ("escaped", "include!(\"t\\x2ers\");"),
+        ("outer", "pub fn f() {}\n#[path = \"../elsewhere/t.rs\"]\nmod t;\n", "pub fn f() {}\n\nmod t;\n"),
+        (
+            "macro",
+            "macro_rules! m {\n    () => {\n        #[path = \"../elsewhere/t.rs\"] mod t;\n    };\n}\n",
+            "macro_rules! m {\n    () => {\n        mod t;\n    };\n}\n",
+        ),
     ];
-    for (case, invocation) in cases {
-        let lib = format!("pub fn f() {{}}\n\n{invocation}\n");
-        let files = [("src/lib.rs", lib.as_str()), ("src/t.rs", "fn g() {}\n")];
-        let (ok, stderr) =
-            run_deps_path(&source_workspace(&format!("include_{case}"), "kernel", DEV_ON_VALIDATION, &files));
-        assert!(
-            !ok && stderr.contains("src/lib.rs: line 3: an include! whose path is not a plain string literal"),
-            "{case}: {stderr}"
-        );
+    for name in ["kernel", "ledger"] {
+        for dev in [false, true] {
+            for (case, with, without) in cases {
+                let line = if case == "outer" { 2 } else { 3 };
+                let files = [("src/lib.rs", with), ("src/t.rs", ""), ("elsewhere/t.rs", "")];
+                let (ok, stderr) = run_source(&format!("path_{name}_{case}_{dev}"), name, dev, &files);
+                let expected = format!("forbidden #[path] in {name} src/ at ");
+                assert!(!ok, "{name} {case} (dev {dev}): a #[path] in src/ passes:\n{stderr}");
+                assert!(stderr.contains(&expected), "{name} {case}: {stderr}");
+                assert!(stderr.contains(&format!("src/lib.rs:{line}")), "{name} {case}: no file and line:\n{stderr}");
+                assert!(stderr.contains("(R-189)"), "{name} {case}: does not cite R-189:\n{stderr}");
+                // Control: the same file without the attribute.
+                let files = [("src/lib.rs", without), ("src/t.rs", ""), ("elsewhere/t.rs", "")];
+                let (ok, stderr) = run_source(&format!("path_{name}_{case}_{dev}_control"), name, dev, &files);
+                assert!(ok, "{name} {case} (dev {dev}): control, without the attribute, fails:\n{stderr}");
+            }
+        }
     }
-    let control = [
-        ("src/lib.rs", "pub fn f() {}\n\ninclude!(\"t.rs\");\n"),
-        ("src/t.rs", "const S: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/x\"));\n"),
-        ("src/u.rs", "const B: &[u8] = include_bytes!(env!(\"X\"));\n"),
+}
+
+/// R-189: a `path` under `cfg_attr` in kernel src/ fails, naming the file and line. Control: the same file with the
+/// `cfg_attr` carrying another attribute passes.
+#[test]
+fn deps_a_cfg_attr_path_in_kernel_src_fails() {
+    let with = "pub fn f() {}\n\n#[cfg_attr(test, path = \"../elsewhere/t.rs\")]\nmod t;\n";
+    let files = [("src/lib.rs", with), ("src/t.rs", ""), ("elsewhere/t.rs", "")];
+    let (ok, stderr) = run_source("cfg_attr_path", "kernel", true, &files);
+    assert!(!ok && stderr.contains("forbidden #[path] in kernel src/ at "), "{stderr}");
+    assert!(stderr.contains("src/lib.rs:3") && stderr.contains("(R-189)"), "{stderr}");
+    let without = "pub fn f() {}\n\n#[cfg_attr(test, allow(dead_code))]\nmod t;\n";
+    let files = [("src/lib.rs", without), ("src/t.rs", "")];
+    let (ok, stderr) = run_source("cfg_attr_path_control", "kernel", true, &files);
+    assert!(ok, "control, cfg_attr without path, fails:\n{stderr}");
+}
+
+/// R-189: an `include!` in kernel or ledger src/ fails, naming the file and line and citing R-189, with or without a
+/// dependency on validation: bare, `std::`- and `core::`-qualified, with any delimiter, and inside a `macro_rules!`
+/// body. Controls: the same file without the macro passes, and so does `include_str!`/`include_bytes!` in its place.
+#[test]
+fn deps_an_include_in_kernel_or_ledger_src_fails() {
+    let cases = [
+        ("bare", "pub fn f() {}\n\ninclude!(\"t.rs\");\n"),
+        ("std", "pub fn f() {}\n\nstd::include!(\"t.rs\");\n"),
+        ("core", "pub fn f() {}\n\ncore::include! { concat!(env!(\"OUT_DIR\"), \"/t.rs\") }\n"),
+        ("macro", "macro_rules! m {\n    () => {\n        include!(\"t.rs\");\n    };\n}\n"),
     ];
-    let (ok, stderr) = run_deps_path(&source_workspace("include_literal", "kernel", DEV_ON_VALIDATION, &control));
-    assert!(ok, "control, a literal include! path, fails:\n{stderr}");
+    for name in ["kernel", "ledger"] {
+        for dev in [false, true] {
+            for (case, with) in cases {
+                let files = [("src/lib.rs", with), ("src/t.rs", "")];
+                let (ok, stderr) = run_source(&format!("include_{name}_{case}_{dev}"), name, dev, &files);
+                assert!(!ok, "{name} {case} (dev {dev}): an include! in src/ passes:\n{stderr}");
+                assert!(stderr.contains(&format!("forbidden include! in {name} src/ at ")), "{name} {case}: {stderr}");
+                assert!(stderr.contains("src/lib.rs:3"), "{name} {case}: no file and line:\n{stderr}");
+                assert!(stderr.contains("(R-189)"), "{name} {case}: does not cite R-189:\n{stderr}");
+                // Controls: the same file without the macro, and with include_str!/include_bytes! in its place.
+                let without = with.replace("include!", "stringify!");
+                let as_str = with.replace("include!", "include_str!");
+                let as_bytes = with.replace("include!", "include_bytes!");
+                for (tag, text) in [("without", without), ("str", as_str), ("bytes", as_bytes)] {
+                    let files = [("src/lib.rs", text.as_str()), ("src/t.rs", "")];
+                    let (ok, stderr) =
+                        run_source(&format!("include_{name}_{case}_{dev}_{tag}"), name, dev, &files);
+                    assert!(ok, "{name} {case} (dev {dev}): control {tag} fails:\n{stderr}");
+                }
+            }
+        }
+    }
 }
