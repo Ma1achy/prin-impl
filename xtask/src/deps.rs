@@ -9,8 +9,10 @@
 //! the dev-dependency cycle would give unit tests two copies of the crate (`Metadata::source_violations`). The scan
 //! fails on any identifier named `validation` there, a local item included (a deliberate over-approximation: it
 //! has no name resolution), and requires the crates' library and binary targets in `src/`. So that the scan of the
-//! `.rs` files under `src/` is the whole of what those crates compile there, `#[path]` and `include!` are forbidden
-//! in their `src/` (R-189, which replaces R-188's following of `include!`).
+//! `.rs` files under `src/` is the whole of what those crates compile there, `#[path]`, any `include` identifier and
+//! any attribute holding a macro variable are forbidden in their `src/` (R-189, which replaces R-188's following of
+//! `include!`; R-190). The one exception is kernel's item-level `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))`,
+//! the route by which the ledger's generated code reaches it (R-185, R-190).
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -274,8 +276,11 @@ impl Metadata {
     }
 
     /// In each crate of `NO_VALIDATION_IN_SRC`, every `.rs` file under its `src/` is scanned (`scan_text`):
-    /// - R-189: any `#[path = …]` attribute (under `cfg_attr` too) and any `include!` invocation is a violation,
-    ///   whether or not the crate depends on `validation`, so no file outside `src/` joins the crate unscanned;
+    /// - R-189, R-190: any `#[path = …]` attribute (under `cfg_attr` too), any `include` identifier and any attribute
+    ///   holding a macro variable is a violation, whether or not the crate depends on `validation`, so no file
+    ///   outside `src/` joins the crate unscanned. The exception: in `OUT_DIR_INCLUDE` (kernel), the item-level
+    ///   `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))` passes, unless the crate's `src/` also defines or aliases
+    ///   a macro named `concat` or `env`, which would make that form load another file (each such site then fails);
     /// - R-187: when the crate depends on `validation`, any identifier named `validation` or the name the crate
     ///   gives the dependency is a violation (a deliberate over-approximation that fails local items with that
     ///   name too).
@@ -291,6 +296,7 @@ impl Metadata {
         let validation = members.iter().find(|m| m.name == "validation");
         let mut violations = Vec::new();
         for package in members.iter().filter(|m| NO_VALIDATION_IN_SRC.contains(&m.name.as_str())) {
+            let out_dir_include = OUT_DIR_INCLUDE.contains(&package.name.as_str());
             let Some(dir) = package.manifest_path.as_deref().and_then(|m| Path::new(m).parent()) else {
                 if require_sources {
                     return Err(format!("{}: cargo metadata gives no manifest_path", package.name));
@@ -316,18 +322,27 @@ impl Metadata {
                 }
                 continue;
             }
+            let (mut includes, mut shadows) = (0, Vec::new());
             for file in rust_files(&src)? {
                 let text = std::fs::read_to_string(&file)
                     .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-                let found = scan_text(&text, &names).map_err(|e| {
+                let scan = scan_text(&text, &names, out_dir_include).map_err(|e| {
                     format!(
                         "{}: {e}; it cannot be checked for a use of validation (R-187) or for #[path] and \
-                         include! (R-189)",
+                         include! (R-189, R-190)",
                         file.display()
                     )
                 })?;
-                for (line, what) in found {
+                for (line, what) in scan.found {
                     violations.push(SourceViolation { krate: package.name.clone(), file: file.clone(), line, what });
+                }
+                includes += scan.out_dir_includes.len();
+                shadows.extend(scan.shadows.into_iter().map(|line| (file.clone(), line)));
+            }
+            if includes > 0 {
+                for (file, line) in shadows {
+                    let what = Forbidden::ShadowedBuiltin;
+                    violations.push(SourceViolation { krate: package.name.clone(), file, line, what });
                 }
             }
         }
@@ -393,6 +408,11 @@ impl Package {
 /// The crates in which no source under `src/` may use `validation` (systems_architecture §7.1; R-187).
 pub const NO_VALIDATION_IN_SRC: &[&str] = &["kernel", "ledger"];
 
+/// The crates of `NO_VALIDATION_IN_SRC` whose `src/` may hold the item-level
+/// `include!(concat!(env!("OUT_DIR"), "/<name>.rs"))`: kernel, into which the ledger generates code at build time
+/// (R-185, R-190). Ledger allows no `include!` at all.
+pub const OUT_DIR_INCLUDE: &[&str] = &["kernel"];
+
 /// What a source under `src/` of a crate in `NO_VALIDATION_IN_SRC` holds that it must not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Forbidden {
@@ -400,8 +420,13 @@ pub enum Forbidden {
     Validation,
     /// A `#[path = …]` attribute, under `cfg_attr` too (R-189).
     PathAttribute,
-    /// An `include!` invocation, path-qualified or not (R-189).
+    /// An `include` identifier other than kernel's item-level `OUT_DIR` form (R-189, R-190).
     Include,
+    /// An attribute holding a macro variable: `#[$a]`, `#[cfg_attr(…, $a)]`, `# $a` (R-190).
+    MacroVariableAttribute,
+    /// A macro named `concat` or `env` defined or aliased in a crate whose `src/` uses the `OUT_DIR` include, which
+    /// that form would then call in place of the builtin (R-190).
+    ShadowedBuiltin,
 }
 
 /// A forbidden item in a source under `src/` of a crate in `NO_VALIDATION_IN_SRC`.
@@ -428,13 +453,26 @@ impl fmt::Display for SourceViolation {
             ),
             Forbidden::PathAttribute => write!(
                 f,
-                "forbidden #[path] in {at}: kernel and ledger src/ use neither #[path] nor include!, so that every \
-                 file they compile there is a .rs file under src/ (R-189)"
+                "forbidden #[path] in {at}: kernel and ledger src/ use no #[path], so that every file they compile \
+                 there is a .rs file under src/ (R-189, R-190)"
             ),
             Forbidden::Include => write!(
                 f,
-                "forbidden include! in {at}: kernel and ledger src/ use neither #[path] nor include!, so that every \
-                 file they compile there is a .rs file under src/ (R-189)"
+                "forbidden include! in {at}: kernel and ledger src/ use no include identifier (an alias, a macro \
+                 argument and a path-qualified include! included), so that every file they compile there is a .rs \
+                 file under src/; the one exception is kernel's item-level \
+                 include!(concat!(env!(\"OUT_DIR\"), \"/<name>.rs\")), outside any macro body (R-189, R-190)"
+            ),
+            Forbidden::MacroVariableAttribute => write!(
+                f,
+                "forbidden attribute with a macro variable in {at}: kernel and ledger src/ use no attribute whose \
+                 contents hold a macro variable ($), which could expand to #[path] (R-189, R-190)"
+            ),
+            Forbidden::ShadowedBuiltin => write!(
+                f,
+                "forbidden macro named concat or env in {at}: this crate's src/ uses \
+                 include!(concat!(env!(\"OUT_DIR\"), …)), which is allowed only with the builtin concat! and env!; \
+                 this one would take their place and could load a file outside src/ (R-190)"
             ),
         }
     }
@@ -475,9 +513,20 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// The forbidden items in `text`, each with its 1-based line, sorted and without duplicates. `text` is lexed with
-/// `proc-macro2`; a file that does not lex is an error, so it is never passed unscanned. Comments and string, char
-/// and byte literals are never tokens, so they hold nothing; macro bodies and attributes are scanned too.
+/// What `scan_text` finds in one file.
+#[derive(Debug, Default)]
+struct Scan {
+    /// The forbidden items, each with its 1-based line, sorted and without duplicates.
+    found: Vec<(usize, Forbidden)>,
+    /// The lines of the allowed item-level `OUT_DIR` includes (only when they are allowed).
+    out_dir_includes: Vec<usize>,
+    /// The lines that define or alias a macro named `concat` or `env` (only when `OUT_DIR` includes are allowed).
+    shadows: Vec<usize>,
+}
+
+/// The forbidden items in `text`. `text` is lexed with `proc-macro2`; a file that does not lex is an error, so it is
+/// never passed unscanned. Comments and string, char and byte literals are never tokens, so they hold nothing; macro
+/// bodies and attributes are scanned too.
 ///
 /// - `Forbidden::Validation`: an identifier in `names` (a raw identifier `r#name` counts). Every such identifier
 ///   counts as a use of the crate, a local item with the same name included (`mod validation`, `fn validation`, an
@@ -486,28 +535,66 @@ fn normalize(path: &Path) -> PathBuf {
 ///   so a check without it that must never pass a real use has to fail both. Rename the local item.
 /// - `Forbidden::PathAttribute` (R-189): an identifier `path` followed by `=` anywhere inside an attribute, so
 ///   `#[path = …]`, `#![path = …]` and `#[cfg_attr(…, path = …)]`, in a `macro_rules!` body too. Another attribute
-///   with a `path = …` argument fails as well (an over-approximation, never under).
-/// - `Forbidden::Include` (R-189): an identifier `include` followed by `!`, so `include!`, `std::include!` and
-///   `core::include!`, whatever their argument, in a `macro_rules!` body too. `include_str!` and `include_bytes!`
-///   are other identifiers and stay allowed: they expand to a `&str` or `&[u8]` value, never to Rust tokens.
-fn scan_text(text: &str, names: &[String]) -> Result<Vec<(usize, Forbidden)>, String> {
-    fn walk(stream: TokenStream, names: &[String], in_attr: bool, found: &mut Vec<(usize, Forbidden)>) {
+///   with a `path = …` argument fails as well (an over-approximation, never under). A `path` outside an attribute
+///   (`let path = …`) is not one (R-190).
+/// - `Forbidden::Include` (R-189, R-190): any identifier `include` (a raw `r#include` too), whatever follows it, so
+///   `include!`, `std::include!`, `use std::include as inc`, `m!(include)`, in a `macro_rules!` body too. The one
+///   exception, when `out_dir_include` is set (kernel): `out_dir_include_at` holds. `include_str!` and
+///   `include_bytes!` are other identifiers and stay allowed: they expand to a `&str` or `&[u8]` value, never to
+///   Rust tokens.
+/// - `Forbidden::MacroVariableAttribute` (R-190): a `$` anywhere inside an attribute (`#[$a]`, `#[$($t)*]`,
+///   `#[cfg_attr(…, $a)]`), or an attribute whose brackets are themselves a macro variable (`# $a`, `#! $a`).
+///
+/// With `out_dir_include` set, `Scan::shadows` also lists `macro_rules! concat|env`, `macro concat|env` and
+/// `as concat|env`, the ways a crate can put its own macro in place of the builtin the exception names.
+fn scan_text(text: &str, names: &[String], out_dir_include: bool) -> Result<Scan, String> {
+    struct Ctx<'a> {
+        names: &'a [String],
+        out_dir_include: bool,
+        scan: Scan,
+    }
+    /// `item_level`: `stream` is the file or the body of a `mod name { … }` reached from it through `mod` bodies
+    /// only, so never a macro definition, a macro invocation, a function body or an attribute.
+    fn walk(stream: TokenStream, ctx: &mut Ctx<'_>, in_attr: bool, item_level: bool) {
         let trees: Vec<TokenTree> = stream.into_iter().collect();
         let punct = |k: usize, c: char| matches!(trees.get(k), Some(TokenTree::Punct(p)) if p.as_char() == c);
+        let ident = |k: usize, w: &str| matches!(trees.get(k), Some(TokenTree::Ident(id)) if id == w);
         for (i, tree) in trees.iter().enumerate() {
             match tree {
                 TokenTree::Ident(id) => {
                     let line = id.span().start().line;
                     let word = id.to_string();
                     let word = word.strip_prefix("r#").unwrap_or(&word);
-                    if names.iter().any(|n| n == word) {
-                        found.push((line, Forbidden::Validation));
+                    if ctx.names.iter().any(|n| n == word) {
+                        ctx.scan.found.push((line, Forbidden::Validation));
                     }
                     if in_attr && word == "path" && punct(i + 1, '=') {
-                        found.push((line, Forbidden::PathAttribute));
+                        ctx.scan.found.push((line, Forbidden::PathAttribute));
                     }
-                    if word == "include" && punct(i + 1, '!') {
-                        found.push((line, Forbidden::Include));
+                    if word == "include" {
+                        if ctx.out_dir_include && !in_attr && item_level && out_dir_include_at(&trees, i) {
+                            ctx.scan.out_dir_includes.push(line);
+                        } else {
+                            ctx.scan.found.push((line, Forbidden::Include));
+                        }
+                    }
+                    let shadow = |w: &str| {
+                        (w == "concat" || w == "env")
+                            && ((punct(i.wrapping_sub(1), '!') && ident(i.wrapping_sub(2), "macro_rules"))
+                                || ident(i.wrapping_sub(1), "macro")
+                                || ident(i.wrapping_sub(1), "as"))
+                    };
+                    if ctx.out_dir_include && shadow(word) {
+                        ctx.scan.shadows.push(line);
+                    }
+                }
+                TokenTree::Punct(p) => {
+                    let line = p.span().start().line;
+                    if in_attr && p.as_char() == '$' {
+                        ctx.scan.found.push((line, Forbidden::MacroVariableAttribute));
+                    }
+                    if p.as_char() == '#' && (punct(i + 1, '$') || (punct(i + 1, '!') && punct(i + 2, '$'))) {
+                        ctx.scan.found.push((line, Forbidden::MacroVariableAttribute));
                     }
                 }
                 TokenTree::Group(group) => {
@@ -515,18 +602,94 @@ fn scan_text(text: &str, names: &[String]) -> Result<Vec<(usize, Forbidden)>, St
                     let attr = group.delimiter() == Delimiter::Bracket
                         && (punct(i.wrapping_sub(1), '#')
                             || (punct(i.wrapping_sub(1), '!') && punct(i.wrapping_sub(2), '#')));
-                    walk(group.stream(), names, in_attr || attr, found);
+                    let mod_body = group.delimiter() == Delimiter::Brace
+                        && matches!(trees.get(i.wrapping_sub(1)), Some(TokenTree::Ident(_)))
+                        && ident(i.wrapping_sub(2), "mod");
+                    walk(group.stream(), ctx, in_attr || attr, item_level && mod_body && !attr);
                 }
-                TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+                TokenTree::Literal(_) => {}
             }
         }
     }
     let stream = TokenStream::from_str(text).map_err(|e| format!("cannot lex it: {e}"))?;
-    let mut found = Vec::new();
-    walk(stream, names, false, &mut found);
-    found.sort_by_key(|&(line, what)| (line, what as u8));
-    found.dedup();
-    Ok(found)
+    let mut ctx = Ctx { names, out_dir_include, scan: Scan::default() };
+    walk(stream, &mut ctx, false, true);
+    let mut scan = ctx.scan;
+    scan.found.sort_by_key(|&(line, what)| (line, what as u8));
+    scan.found.dedup();
+    Ok(scan)
+}
+
+/// Whether `trees[i]`, an identifier `include` in an item-level stream, is the start of the one `include!` R-190
+/// allows in kernel `src/`: the bare identifier `include` (not raw, not path-qualified), at the start of an item
+/// (after nothing, `;`, a `{ … }` item or outer or inner attributes), followed by `!`, then exactly
+/// `(concat!(env!("OUT_DIR"), "/<name>.rs"))`, then `;`. `<name>` is a plain file name: ASCII letters, digits, `_`,
+/// `-` and `.`, not starting with `.`, with no `..`, ending in `.rs`. Anything that differs is not the form.
+fn out_dir_include_at(trees: &[TokenTree], i: usize) -> bool {
+    let punct = |k: usize, c: char| matches!(trees.get(k), Some(TokenTree::Punct(p)) if p.as_char() == c);
+    if !matches!(&trees[i], TokenTree::Ident(id) if id == "include") {
+        return false;
+    }
+    // The start of an item: skip back over attributes, then nothing, `;` or a `{ … }` group.
+    let mut k = i;
+    let item_start = loop {
+        if k == 0 {
+            break true;
+        }
+        match &trees[k - 1] {
+            TokenTree::Punct(p) if p.as_char() == ';' => break true,
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => break true,
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket && k >= 2 && punct(k - 2, '#') => k -= 2,
+            TokenTree::Group(g)
+                if g.delimiter() == Delimiter::Bracket && k >= 3 && punct(k - 2, '!') && punct(k - 3, '#') =>
+            {
+                k -= 3
+            }
+            _ => break false,
+        }
+    };
+    let Some(TokenTree::Group(arg)) = trees.get(i + 2) else { return false };
+    item_start && punct(i + 1, '!') && arg.delimiter() == Delimiter::Parenthesis && punct(i + 3, ';')
+        && out_dir_argument(arg.stream())
+}
+
+/// Whether `stream` is exactly `concat!(env!("OUT_DIR"), "/<name>.rs")` (see `out_dir_include_at`).
+fn out_dir_argument(stream: TokenStream) -> bool {
+    let is = |t: Option<&TokenTree>, w: &str| match t {
+        Some(TokenTree::Ident(id)) => id == w,
+        Some(TokenTree::Punct(p)) => w.len() == 1 && w.starts_with(p.as_char()),
+        Some(TokenTree::Literal(l)) => l.to_string() == w,
+        _ => false,
+    };
+    let paren = |t: Option<&TokenTree>| match t {
+        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
+            Some(g.stream().into_iter().collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    let outer: Vec<TokenTree> = stream.into_iter().collect();
+    let Some(concat) = paren(outer.get(2)) else { return false };
+    let Some(env) = paren(concat.get(2)) else { return false };
+    let file_name = |t: Option<&TokenTree>| {
+        let Some(TokenTree::Literal(l)) = t else { return false };
+        let text = l.to_string();
+        let Some(name) = text.strip_prefix("\"/").and_then(|n| n.strip_suffix('"')) else { return false };
+        name.len() > ".rs".len()
+            && name.ends_with(".rs")
+            && !name.starts_with('.')
+            && !name.contains("..")
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    outer.len() == 3
+        && is(outer.first(), "concat")
+        && is(outer.get(1), "!")
+        && concat.len() == 5
+        && is(concat.first(), "env")
+        && is(concat.get(1), "!")
+        && env.len() == 1
+        && is(env.first(), "\"OUT_DIR\"")
+        && is(concat.get(3), ",")
+        && file_name(concat.get(4))
 }
 
 #[cfg(test)]
@@ -534,7 +697,7 @@ mod tests {
     use super::{scan_text, Forbidden};
 
     fn lines(src: &str) -> Vec<usize> {
-        let found = scan_text(src, &["validation".to_owned()]).unwrap();
+        let found = scan_text(src, &["validation".to_owned()], false).unwrap().found;
         found.into_iter().filter(|&(_, what)| what == Forbidden::Validation).map(|(line, _)| line).collect()
     }
 
@@ -567,8 +730,8 @@ mod tests {
 
     #[test]
     fn scan_text_fails_on_a_file_that_does_not_lex() {
-        assert!(scan_text("fn f() { \"unterminated }", &["validation".to_owned()]).is_err());
+        assert!(scan_text("fn f() { \"unterminated }", &["validation".to_owned()], false).is_err());
         // Control: the same file, terminated.
-        assert!(scan_text("fn f() { \"terminated\" }", &["validation".to_owned()]).is_ok());
+        assert!(scan_text("fn f() { \"terminated\" }", &["validation".to_owned()], false).is_ok());
     }
 }
