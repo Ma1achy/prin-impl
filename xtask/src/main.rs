@@ -8,7 +8,7 @@ Commands:
   ci                         run every registered per-push runner, in order (R-177)
   deps [--metadata <file>]   check the workspace crate graph against systems_architecture §7.1, and
                              that kernel and ledger use validation only outside src/ (R-187),
-                             following #[path] and include! (R-188)
+                             and use neither #[path] nor include! in src/ (R-189)
                              (reads `cargo metadata --format-version 1`, or <file> if given)";
 
 fn main() -> ExitCode {
@@ -60,7 +60,7 @@ fn deps(fixture: Option<PathBuf>) -> Result<(), String> {
         eprintln!("xtask deps: {source_use}");
     }
     Err(format!(
-        "{} forbidden workspace edge(s), {} forbidden use(s) of validation under src/ (REQ-SYS-004)",
+        "{} forbidden workspace edge(s), {} forbidden item(s) in kernel or ledger src/ (REQ-SYS-004)",
         violations.len(),
         uses.len()
     ))
