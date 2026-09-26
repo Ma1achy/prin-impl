@@ -1,13 +1,14 @@
-//! QA tests for TASK-M0-01, round 5: R-188, written from REQ-SYS-004's verify detail ("in kernel and ledger no
-//! source under src/ uses validation (R-187), counting every file loaded through #[path] or include!, and an
-//! include! path that is not a string literal, or does not resolve, fails (R-188)") and `decisions.md` § "R-188"
-//! item 2 ("`cargo xtask deps` follows `include!` string paths as it follows `#[path]`, and scans the file; a path
-//! it can't resolve ... fails the check") — not from the implementation.
+//! QA tests for TASK-M0-01, round 5 layouts, brought in line with R-189 (`decisions.md` § "R-189 — kernel and ledger
+//! `src/` use neither `#[path]` nor `include!`"), which replaces R-188 item 2. Written from REQ-SYS-004's verify
+//! detail ("in kernel and ledger src/, #[path] (including under cfg_attr) and include! are forbidden, and cargo
+//! xtask deps fails on any occurrence, naming the file and line (R-189)") and R-189's text ("The R-187 scan then
+//! covers the `.rs` files under `src/` only, and no longer follows `#[path]` or `include!` into other files") — not
+//! from the implementation.
 //!
-//! "Loaded" means loaded by rustc. Where a case depends on how rustc resolves a path, the test first compiles the
-//! crate's `src/lib.rs` with `rustc` and asserts rustc reads the file the case names (a premise check), so the
-//! expectation is rustc's, not the checker's. Each failing case has a control (R-176): the same layout with the use
-//! of `validation` removed passes.
+//! Each layout that round 5 used to require be *followed* now must fail at the `include!` or `#[path]` itself,
+//! naming the file under `src/` and the line, whether the loaded file uses `validation` or not. The control for
+//! each (R-176) is the same layout with the `include!` / `#[path]` removed: the file outside `src/`, even one that
+//! uses `validation`, is then compiled by nothing and must not be scanned, so the check passes.
 #![allow(non_snake_case)]
 
 use std::path::{Path, PathBuf};
@@ -121,83 +122,102 @@ fn rustc_loads(crates: &Path, krate: &str, expected: &str) {
 const USE_IT: &str = "#[cfg(test)]\nfn t() { validation::run(); }\n";
 const PLAIN: &str = "#[cfg(test)]\nfn t() {}\n";
 
-/// Asserts `with` (a layout whose file `named` uses validation) fails naming `named`, and `without` passes.
-fn fails_and_control(case: &str, krate: &str, with: &[(&str, &str)], without: &[(&str, &str)], named: &str) {
+/// Asserts that `with` fails naming each of `at` (`"<file under crates/>:<line>"`) as a forbidden `what`
+/// (`"include!"` or `"#[path]"`), citing R-189, and never reports the file outside src/ it would load; and that
+/// `without` (the same layout with the forbidden item removed) passes.
+fn fails_at_and_control(
+    case: &str,
+    krate: &str,
+    with: &[(&str, &str)],
+    without: &[(&str, &str)],
+    what: &str,
+    at: &[&str],
+    not_named: &str,
+) {
     let (meta, _) = workspace(case, krate, with);
     let (ok, text) = run(&meta);
-    assert!(!ok, "{case}: a use of validation in a file rustc loads through include! or #[path] passes xtask deps:\n{text}");
-    assert!(text.contains(named), "{case}: the failure does not name {named}:\n{text}");
+    assert!(!ok, "{case}: a {what} in {krate} src/ passes xtask deps (R-189):\n{text}");
+    for site in at {
+        let expected = format!("forbidden {what} in {krate} src/ at ");
+        let line = text.lines().find(|l| l.contains(&expected) && l.contains(site));
+        assert!(line.is_some(), "{case}: the failure does not name {what} at {site}:\n{text}");
+        assert!(line.unwrap().contains("R-189"), "{case}: the failure does not cite R-189:\n{text}");
+    }
+    assert!(
+        !text.contains(not_named),
+        "{case}: the scan followed the {what} into {not_named}, which R-189 says it no longer does:\n{text}"
+    );
     let (meta, _) = workspace(&format!("{case}_control"), krate, without);
     let (ok, text) = run(&meta);
-    assert!(ok, "{case}: control, the same layout without the use, fails:\n{text}");
+    assert!(ok, "{case}: control, the same layout without the {what}, fails:\n{text}");
 }
 
-/// R-188 applies to ledger as to kernel: a use in a file outside src/ that ledger's src/lib.rs includes fails.
+/// R-189 applies to ledger as to kernel: an `include!` of a file outside src/ fails at the `include!`, whether or
+/// not the included file uses validation.
 #[test]
-fn qa_ledger_include_of_a_file_outside_src_is_scanned() {
-    let lib = ("ledger/src/lib.rs", "include!(\"../gen/t.rs\");\n");
-    let (_, crates) = workspace("ledger_premise", "ledger", &[lib, ("ledger/gen/t.rs", USE_IT)]);
-    rustc_loads(&crates, "ledger", "gen/t.rs");
-    fails_and_control(
-        "ledger_outside",
-        "ledger",
-        &[lib, ("ledger/gen/t.rs", USE_IT)],
-        &[lib, ("ledger/gen/t.rs", PLAIN)],
+fn qa_ledger_include_of_a_file_outside_src_fails() {
+    let lib = ("ledger/src/lib.rs", "pub fn f() {}\ninclude!(\"../gen/t.rs\");\n");
+    let bare = ("ledger/src/lib.rs", "pub fn f() {}\n");
+    for (tag, t) in [("use", USE_IT), ("plain", PLAIN)] {
+        fails_at_and_control(
+            &format!("ledger_outside_{tag}"),
+            "ledger",
+            &[lib, ("ledger/gen/t.rs", t)],
+            &[bare, ("ledger/gen/t.rs", t)],
+            "include!",
+            &["ledger/src/lib.rs:2"],
+            "gen/t.rs",
+        );
+    }
+}
+
+/// An `include!` of a file without the `.rs` extension fails at the `include!`.
+#[test]
+fn qa_include_of_a_file_without_rs_extension_fails() {
+    let lib = ("kernel/src/lib.rs", "include!(\"../gen/tests.in\");\n");
+    let bare = ("kernel/src/lib.rs", "\n");
+    for (tag, t) in [("use", USE_IT), ("plain", PLAIN)] {
+        fails_at_and_control(
+            &format!("ext_{tag}"),
+            "kernel",
+            &[lib, ("kernel/gen/tests.in", t)],
+            &[bare, ("kernel/gen/tests.in", t)],
+            "include!",
+            &["kernel/src/lib.rs:1"],
+            "gen/tests.in",
+        );
+    }
+}
+
+/// An `include!` of a file that itself declares modules fails at the `include!`; nothing in the included file
+/// or its modules is scanned.
+#[test]
+fn qa_include_of_a_file_declaring_modules_fails() {
+    let lib = ("kernel/src/lib.rs", "pub fn f() {}\n\ninclude!(\"../gen/deep/a.rs\");\n");
+    let bare = ("kernel/src/lib.rs", "pub fn f() {}\n");
+    let a = ("kernel/gen/deep/a.rs", "mod b;\n#[cfg(test)]\nmod tests {\n    fn t() { validation::run(); }\n}\n");
+    let b = ("kernel/gen/deep/b.rs", USE_IT);
+    fails_at_and_control("mod_in_included", "kernel", &[lib, a, b], &[bare, a, b], "include!", &["kernel/src/lib.rs:3"], "gen/deep");
+}
+
+/// An `include!` naming a directory fails at the `include!` (as every `include!` does).
+#[test]
+fn qa_include_of_a_directory_fails() {
+    let lib = ("kernel/src/lib.rs", "pub fn f() {}\ninclude!(\"../gen\");\n");
+    let bare = ("kernel/src/lib.rs", "pub fn f() {}\n");
+    fails_at_and_control(
+        "dir",
+        "kernel",
+        &[lib, ("kernel/gen/t.rs", PLAIN)],
+        &[bare, ("kernel/gen/t.rs", PLAIN)],
+        "include!",
+        &["kernel/src/lib.rs:2"],
         "gen/t.rs",
     );
 }
 
-/// An included file need not end in `.rs`: rustc parses whatever file the literal names.
-#[test]
-fn qa_include_of_a_file_without_rs_extension_is_scanned() {
-    let lib = ("kernel/src/lib.rs", "include!(\"../gen/tests.in\");\n");
-    let (_, crates) = workspace("ext_premise", "kernel", &[lib, ("kernel/gen/tests.in", USE_IT)]);
-    rustc_loads(&crates, "kernel", "gen/tests.in");
-    fails_and_control(
-        "ext",
-        "kernel",
-        &[lib, ("kernel/gen/tests.in", USE_IT)],
-        &[lib, ("kernel/gen/tests.in", PLAIN)],
-        "gen/tests.in",
-    );
-}
-
-/// A use inside an inline `mod tests { … }` of the included file, and a `mod` the included file declares (resolved
-/// by rustc relative to the included file), are both scanned.
-#[test]
-fn qa_include_modules_inside_the_included_file_are_scanned() {
-    let lib = ("kernel/src/lib.rs", "include!(\"../gen/deep/a.rs\");\n");
-    let a = ("kernel/gen/deep/a.rs", "mod b;\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n");
-    let (_, crates) = workspace("mod_premise", "kernel", &[lib, a, ("kernel/gen/deep/b.rs", USE_IT)]);
-    rustc_loads(&crates, "kernel", "gen/deep/b.rs");
-    fails_and_control(
-        "mod_in_included",
-        "kernel",
-        &[lib, a, ("kernel/gen/deep/b.rs", USE_IT)],
-        &[lib, a, ("kernel/gen/deep/b.rs", PLAIN)],
-        "gen/deep/b.rs",
-    );
-    let inline = ("kernel/gen/deep/a.rs", "#[cfg(test)]\nmod tests {\n    fn t() { validation::run(); }\n}\n");
-    let inline_plain = ("kernel/gen/deep/a.rs", "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n");
-    fails_and_control("inline_in_included", "kernel", &[lib, inline], &[lib, inline_plain], "gen/deep/a.rs");
-}
-
-/// An `include!` whose literal names a directory, not a file, does not resolve to a file: it fails.
-#[test]
-fn qa_include_of_a_directory_fails() {
-    let lib = ("kernel/src/lib.rs", "pub fn f() {}\ninclude!(\"../gen\");\n");
-    let (meta, _) = workspace("dir", "kernel", &[lib, ("kernel/gen/t.rs", PLAIN)]);
-    let (ok, text) = run(&meta);
-    assert!(!ok, "an include! of a directory passes xtask deps:\n{text}");
-    assert!(text.contains("src/lib.rs"), "the failure does not name the including file:\n{text}");
-    let good = ("kernel/src/lib.rs", "pub fn f() {}\ninclude!(\"../gen/t.rs\");\n");
-    let (meta, _) = workspace("dir_control", "kernel", &[good, ("kernel/gen/t.rs", PLAIN)]);
-    let (ok, text) = run(&meta);
-    assert!(ok, "control, the include! naming the file, fails:\n{text}");
-}
-
-/// An `include!` whose path is a macro variable is not a string literal at the invocation the checker sees: it
-/// fails (R-188: "an include! path that is not a string literal ... fails").
+/// An `include!` inside a `macro_rules!` body whose path is a macro variable fails at the `include!`. The premise
+/// check shows rustc does load the file through it.
 #[test]
 fn qa_include_through_a_macro_variable_fails() {
     let lib = (
@@ -206,47 +226,54 @@ fn qa_include_through_a_macro_variable_fails() {
     );
     let (_, crates) = workspace("macro_var_premise", "kernel", &[lib, ("kernel/gen/t.rs", USE_IT)]);
     rustc_loads(&crates, "kernel", "gen/t.rs");
-    let (meta, _) = workspace("macro_var", "kernel", &[lib, ("kernel/gen/t.rs", PLAIN)]);
-    let (ok, text) = run(&meta);
-    assert!(!ok, "an include! whose path is a macro variable passes xtask deps:\n{text}");
-    let direct = ("kernel/src/lib.rs", "include!(\"../gen/t.rs\");\n");
-    let (meta, _) = workspace("macro_var_control", "kernel", &[direct, ("kernel/gen/t.rs", PLAIN)]);
-    let (ok, text) = run(&meta);
-    assert!(ok, "control, the same include! with its literal, fails:\n{text}");
+    let bare = ("kernel/src/lib.rs", "macro_rules! inc {\n    ($p:literal) => { stringify!($p); };\n}\n");
+    fails_at_and_control(
+        "macro_var",
+        "kernel",
+        &[lib, ("kernel/gen/t.rs", PLAIN)],
+        &[bare, ("kernel/gen/t.rs", USE_IT)],
+        "include!",
+        &["kernel/src/lib.rs:2"],
+        "gen/t.rs",
+    );
 }
 
-/// rustc resolves an `include!` expanded from a `macro_rules!` relative to the file the macro is invoked in, not
-/// the file that defines it (the premise check shows it). Here the macro is defined in `src/m.rs` and invoked in
-/// `src/a/y.rs`, so rustc loads `kernel/gen/t.rs`, which uses validation. A file also exists at the path read
-/// from the definition's file (`crates/gen/t.rs`, clean), so a checker reading the wrong file finds a file and
-/// no use. The use in the file rustc loads must fail the check.
+/// An `include!` in a `macro_rules!` defined in one file and invoked in another (rustc resolves it at the call
+/// site, the premise check shows) fails at the `include!` in the defining file.
 #[test]
-fn qa_include_in_a_macro_resolves_at_the_call_site() {
-    let files = |t: &'static str| {
+fn qa_include_in_a_macro_invoked_elsewhere_fails() {
+    let files = |m: &'static str, t: &'static str| {
         vec![
             ("kernel/src/lib.rs", "#[macro_use]\nmod m;\nmod a;\n"),
-            ("kernel/src/m.rs", "macro_rules! inc {\n    () => { include!(\"../../gen/t.rs\"); };\n}\n"),
+            ("kernel/src/m.rs", m),
             ("kernel/src/a/mod.rs", "mod y;\n"),
             ("kernel/src/a/y.rs", "inc!();\n"),
             ("kernel/gen/t.rs", t),
             ("gen/t.rs", PLAIN),
         ]
     };
-    let (_, crates) = workspace("macro_site_premise", "kernel", &files(USE_IT));
+    let with = "macro_rules! inc {\n    () => { include!(\"../../gen/t.rs\"); };\n}\n";
+    let without = "macro_rules! inc {\n    () => {};\n}\n";
+    let (_, crates) = workspace("macro_site_premise", "kernel", &files(with, USE_IT));
     rustc_loads(&crates, "kernel", "src/a/../../gen/t.rs");
-    fails_and_control("macro_site", "kernel", &files(USE_IT), &files(PLAIN), "kernel/gen/t.rs");
+    fails_at_and_control(
+        "macro_site",
+        "kernel",
+        &files(with, USE_IT),
+        &files(without, USE_IT),
+        "include!",
+        &["kernel/src/m.rs:2"],
+        "gen/t.rs",
+    );
 }
 
-/// The same for `#[path]` (R-188: include! is followed "as it follows #[path]"): a `#[path]` module expanded from a
-/// `macro_rules!` is resolved by rustc at the call site. The macro is defined in `src/m.rs` and invoked in
-/// `src/a/b/y.rs`, so rustc loads `kernel/gen/t.rs` (premise check); a clean file exists at `crates/gen/t.rs`,
-/// one of the paths the literal names read from the definition's file.
+/// The same for `#[path]` inside a `macro_rules!` body: it fails at the attribute in the defining file.
 #[test]
-fn qa_path_attribute_in_a_macro_resolves_at_the_call_site() {
-    let files = |t: &'static str| {
+fn qa_path_attribute_in_a_macro_invoked_elsewhere_fails() {
+    let files = |m: &'static str, t: &'static str| {
         vec![
             ("kernel/src/lib.rs", "#[macro_use]\nmod m;\nmod a;\n"),
-            ("kernel/src/m.rs", "macro_rules! pm {\n    () => { #[path = \"../../../gen/t.rs\"] mod t; };\n}\n"),
+            ("kernel/src/m.rs", m),
             ("kernel/src/a/mod.rs", "mod b;\n"),
             ("kernel/src/a/b/mod.rs", "mod y;\n"),
             ("kernel/src/a/b/y.rs", "pm!();\n"),
@@ -254,7 +281,17 @@ fn qa_path_attribute_in_a_macro_resolves_at_the_call_site() {
             ("gen/t.rs", PLAIN),
         ]
     };
-    let (_, crates) = workspace("macro_path_premise", "kernel", &files(USE_IT));
+    let with = "macro_rules! pm {\n    () => { #[path = \"../../../gen/t.rs\"] mod t; };\n}\n";
+    let without = "macro_rules! pm {\n    () => {};\n}\n";
+    let (_, crates) = workspace("macro_path_premise", "kernel", &files(with, USE_IT));
     rustc_loads(&crates, "kernel", "src/a/b/../../../gen/t.rs");
-    fails_and_control("macro_path", "kernel", &files(USE_IT), &files(PLAIN), "kernel/gen/t.rs");
+    fails_at_and_control(
+        "macro_path",
+        "kernel",
+        &files(with, USE_IT),
+        &files(without, USE_IT),
+        "#[path]",
+        &["kernel/src/m.rs:2"],
+        "gen/t.rs",
+    );
 }
